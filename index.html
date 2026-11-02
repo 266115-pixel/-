@@ -1,236 +1,197 @@
+<!-- PeerJS 연결 -->
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>STRIKE ZERO - 음성 통화</title>
-
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-
-<style>
-body {
-  background: #10151c;
-  color: white;
-  font-family: Arial, sans-serif;
-  text-align: center;
-  padding: 30px;
-}
-.box {
-  max-width: 420px;
-  margin: auto;
-  padding: 25px;
-  background: #1b2530;
-  border: 1px solid #344452;
-  border-radius: 15px;
-}
-input, button {
-  padding: 12px;
-  margin: 6px;
-  border-radius: 8px;
-  border: none;
-}
-input {
-  width: 80%;
-  background: #0c1117;
-  color: white;
-}
-button {
-  cursor: pointer;
-  background: #20b982;
-  color: white;
-  font-weight: bold;
-}
-button.end {
-  background: #d94343;
-}
-#status {
-  color: #8fffc7;
-  margin: 15px;
-}
-</style>
-</head>
-
-<body>
-
-<div class="box">
-  <h1>🎙️ 음성 통화</h1>
-
-  <p>내 통화 코드</p>
-  <h2 id="myCode">연결 중...</h2>
-
-  <input id="friendCode" placeholder="친구의 통화 코드">
-
-  <br>
-
-  <button onclick="startCall()">📞 통화 걸기</button>
-  <button onclick="answerCall()" id="answerBtn" style="display:none">
-    통화 수락
-  </button>
-
-  <br>
-
-  <button onclick="toggleMic()" id="micBtn">🎤 마이크 끄기</button>
-  <button onclick="hangup()" class="end">통화 종료</button>
-
-  <p id="status">서버 연결 중...</p>
+<!-- 통화 UI -->
+<div id="callbox" style="display:none">
+  <h3>🎙 음성 통화</h3>
+  <div id="callstatus">통화 대기 중</div>
+  <button id="callbtn">📞 음성 통화</button>
+  <button id="hangcall">☎ 통화 종료</button>
 </div>
 
-<audio id="remoteAudio" autoplay playsinline></audio>
-
 <script>
-let peer;
-let currentCall = null;
-let localStream = null;
-let micEnabled = true;
-let incomingCall = null;
+let friendPeer = null;
+let activeFriend = "";
+let friendCall = null;
+let friendCallStream = null;
+let friendCallAudio = null;
+let friendCallTimer = null;
 
-const statusText = document.getElementById("status");
-const myCode = document.getElementById("myCode");
-const answerBtn = document.getElementById("answerBtn");
-const remoteAudio = document.getElementById("remoteAudio");
+const callStatus = text => {
+  const el = document.getElementById("callstatus");
+  if (el) el.textContent = text;
+};
 
-// PeerJS 연결
-peer = new Peer();
-
-peer.on("open", id => {
-  myCode.textContent = id;
-  statusText.textContent = "친구에게 코드를 보내세요.";
-});
-
-// 친구에게 통화가 오면
-peer.on("call", call => {
-  incomingCall = call;
-  answerBtn.style.display = "inline-block";
-  statusText.textContent = "📞 친구가 통화를 요청했어요!";
-});
-
-// 마이크 가져오기
-async function getMic() {
-  if (!localStream) {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      },
-      video: false
-    });
-  }
-  return localStream;
+function showCall(status) {
+  document.getElementById("callbox").style.display = "block";
+  callStatus(status);
 }
 
-// 통화 걸기
-async function startCall() {
-  const friendId = document.getElementById("friendCode").value.trim();
+function startCallTimer() {
+  let sec = 0;
+  friendCallTimer = setInterval(() => {
+    sec++;
+    callStatus(
+      "통화 중 · " +
+      String(Math.floor(sec / 60)).padStart(2, "0") +
+      ":" +
+      String(sec % 60).padStart(2, "0")
+    );
+  }, 1000);
+}
 
-  if (!friendId) {
-    alert("친구의 통화 코드를 입력하세요.");
+function endCall() {
+  if (friendCallTimer) {
+    clearInterval(friendCallTimer);
+    friendCallTimer = null;
+  }
+
+  if (friendCall) {
+    try { friendCall.close(); } catch (e) {}
+    friendCall = null;
+  }
+
+  if (friendCallStream) {
+    friendCallStream.getTracks().forEach(track => track.stop());
+    friendCallStream = null;
+  }
+
+  if (friendCallAudio) {
+    friendCallAudio.srcObject = null;
+    friendCallAudio.remove();
+    friendCallAudio = null;
+  }
+
+  document.getElementById("callbox").style.display = "none";
+  document.getElementById("callbtn").disabled = false;
+  document.getElementById("callbtn").textContent = "📞 음성 통화";
+}
+
+async function startFriendCall() {
+  if (!activeFriend || !friendPeer) {
+    callStatus("친구 연결을 먼저 확인하세요");
+    return;
+  }
+
+  if (!window.isSecureContext ||
+      !navigator.mediaDevices?.getUserMedia) {
+    callStatus("HTTPS 또는 localhost에서 실행해야 합니다.");
     return;
   }
 
   try {
-    statusText.textContent = "마이크 권한 요청 중...";
-    const stream = await getMic();
+    callStatus("마이크 권한 요청 중…");
 
-    currentCall = peer.call(friendId, stream);
+    friendCallStream =
+      await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        },
+        video: false
+      });
 
-    if (!currentCall) {
-      statusText.textContent = "통화 연결에 실패했어요.";
+    const call = friendPeer.call(
+      activeFriend,
+      friendCallStream
+    );
+
+    if (!call) {
+      endCall();
+      callStatus("상대방이 온라인인지 확인하세요.");
       return;
     }
 
-    connectCall(currentCall);
-    statusText.textContent = "친구에게 통화 연결 중...";
-  } catch (err) {
-    statusText.textContent = "마이크 권한을 허용해 주세요.";
-    console.error(err);
+    friendCall = call;
+    showCall("상대방 연결 중…");
+
+    call.on("stream", stream => {
+      friendCallAudio = document.createElement("audio");
+      friendCallAudio.autoplay = true;
+      friendCallAudio.playsInline = true;
+      friendCallAudio.srcObject = stream;
+      document.body.appendChild(friendCallAudio);
+
+      friendCallAudio.play().catch(() => {});
+      showCall("통화 연결됨");
+      startCallTimer();
+    });
+
+    call.on("close", endCall);
+    call.on("error", endCall);
+
+  } catch (error) {
+    endCall();
+    callStatus("마이크 권한을 확인해 주세요.");
   }
 }
 
-// 통화 수락
-async function answerCall() {
-  if (!incomingCall) return;
-
-  try {
-    const stream = await getMic();
-
-    currentCall = incomingCall;
-    incomingCall.answer(stream);
-
-    answerBtn.style.display = "none";
-    connectCall(currentCall);
-
-    statusText.textContent = "통화 연결 중...";
-  } catch (err) {
-    statusText.textContent = "마이크 권한을 허용해 주세요.";
-    console.error(err);
-  }
-}
-
-// 음성 연결
-function connectCall(call) {
-  call.on("stream", stream => {
-    remoteAudio.srcObject = stream;
-    remoteAudio.play().catch(() => {});
-    statusText.textContent = "🟢 통화 연결됨";
-  });
-
-  call.on("close", () => {
-    statusText.textContent = "통화가 종료되었어요.";
-    remoteAudio.srcObject = null;
-  });
-
-  call.on("error", err => {
-    statusText.textContent = "통화 연결 오류";
-    console.error(err);
-  });
-}
-
-// 마이크 켜기/끄기
-function toggleMic() {
-  if (!localStream) {
-    alert("먼저 통화를 시작하세요.");
+function acceptFriendCall(call) {
+  if (!window.isSecureContext ||
+      !navigator.mediaDevices?.getUserMedia) {
+    call.close();
+    alert("HTTPS 또는 localhost에서 실행해야 합니다.");
     return;
   }
 
-  micEnabled = !micEnabled;
+  navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true
+    },
+    video: false
+  }).then(stream => {
+    friendCallStream = stream;
+    friendCall = call;
 
-  localStream.getAudioTracks().forEach(track => {
-    track.enabled = micEnabled;
+    showCall("상대방 연결 중…");
+    call.answer(stream);
+
+    call.on("stream", remoteStream => {
+      friendCallAudio = document.createElement("audio");
+      friendCallAudio.autoplay = true;
+      friendCallAudio.playsInline = true;
+      friendCallAudio.srcObject = remoteStream;
+      document.body.appendChild(friendCallAudio);
+
+      friendCallAudio.play().catch(() => {});
+      showCall("통화 연결됨");
+      startCallTimer();
+    });
+
+    call.on("close", endCall);
+    call.on("error", endCall);
+
+  }).catch(() => {
+    call.close();
+    alert("마이크 권한을 허용해 주세요.");
   });
-
-  document.getElementById("micBtn").textContent =
-    micEnabled ? "🎤 마이크 끄기" : "🔇 마이크 켜기";
 }
 
-// 통화 종료
-function hangup() {
-  if (currentCall) {
-    currentCall.close();
-    currentCall = null;
-  }
+// 통화 버튼
+document.getElementById("callbtn")
+  .addEventListener("click", startFriendCall);
 
-  if (incomingCall) {
-    incomingCall.close();
-    incomingCall = null;
-  }
+// 통화 종료 버튼
+document.getElementById("hangcall")
+  .addEventListener("click", endCall);
 
-  if (localStream) {
-    localStream.getTracks().forEach(track => track.stop());
-    localStream = null;
-  }
+// PeerJS에서 전화가 오면 수락 여부 확인
+function setupIncomingCall(peer) {
+  friendPeer = peer;
 
-  remoteAudio.srcObject = null;
-  answerBtn.style.display = "none";
-  statusText.textContent = "통화 종료";
+  friendPeer.on("call", call => {
+    const accept = confirm(
+      "친구가 음성 통화를 걸었습니다. 받을까요?"
+    );
+
+    if (accept) {
+      acceptFriendCall(call);
+    } else {
+      call.close();
+    }
+  });
 }
-
-peer.on("error", err => {
-  statusText.textContent = "연결 오류: " + err.type;
-  console.error(err);
-});
 </script>
-
-</body>
-</html>
